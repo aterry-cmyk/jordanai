@@ -13,7 +13,8 @@ type Lead = {
 type Call = {
   id: string; lead_id: string; status: string; duration: number
   recording_url: string; ai_summary: string; ai_rating: number; temperature: string
-  created_at: string
+  transcript: string; disposition: string; duration_seconds: number
+  created_at: string; vapi_call_id: string
 }
 type Script = { id: string; name: string; script: string; lead_type: string; is_default: boolean }
 type Note   = { id: string; title: string; content: string; category: string }
@@ -48,6 +49,7 @@ const S: Record<string, React.CSSProperties> = {
   btnOutline: { padding:'7px 14px', background:'transparent', border:'1px solid rgba(255,255,255,.14)', borderRadius:8, color:'#94a3b8', fontSize:12, cursor:'pointer', fontFamily:'Arial,sans-serif' },
   btnSm:      { padding:'5px 11px', fontSize:12 },
   btnDanger:  { padding:'5px 11px', background:'#ef4444', border:'none', borderRadius:7, color:'#fff', fontSize:12, cursor:'pointer', fontFamily:'Arial,sans-serif' },
+  btnSuccess: { padding:'5px 11px', background:'#22c55e', border:'none', borderRadius:7, color:'#fff', fontSize:12, cursor:'pointer', fontFamily:'Arial,sans-serif' },
   modalBg:    { position:'fixed' as const, inset:0, background:'rgba(0,0,0,.65)', zIndex:999, display:'flex', alignItems:'center', justifyContent:'center' },
   modal:      { background:'#111827', border:'1px solid rgba(255,255,255,.14)', borderRadius:12, padding:24, maxHeight:'85vh', overflowY:'auto' as const },
   modalHead:  { display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:18 },
@@ -71,6 +73,7 @@ const STAGE_PILLS: Record<string, { label: string; bg: string; color: string }> 
   closed_lost:     { label:'Closed Lost',  bg:'rgba(255,255,255,.06)', color:'#94a3b8' },
 }
 const TEMP_COLOR: Record<string, string> = { hot:'#ef4444', warm:'#f59e0b', cold:'#60a5fa', not_interested:'#94a3b8' }
+const STAGES = ['new_lead','contacted','appointment_set','doc_request','pre_approved','closed_won']
 
 // ── MAIN COMPONENT ────────────────────────────────────────────────
 export default function App() {
@@ -93,10 +96,28 @@ export default function App() {
   const [selLead,    setSelLead]    = useState<Lead | null>(null)
   const [leadCalls,  setLeadCalls]  = useState<Call[]>([])
 
+  // Filters
+  const [filterStage, setFilterStage] = useState('')
+  const [filterTemp,  setFilterTemp]  = useState('')
+  const [filterLang,  setFilterLang]  = useState('')
+  const [sortBy,      setSortBy]      = useState('created_at')
+
+  // Bulk select
+  const [selectedIds,   setSelectedIds]   = useState<Set<string>>(new Set())
+  const [showBulkEdit,  setShowBulkEdit]  = useState(false)
+  const [bulkStage,     setBulkStage]     = useState('')
+  const [bulkTemp,      setBulkTemp]      = useState('')
+  const [bulkLang,      setBulkLang]      = useState('')
+  const [bulkApplying,  setBulkApplying]  = useState(false)
+
   // Modals
-  const [showImport, setShowImport] = useState(false)
-  const [showScript, setShowScript] = useState(false)
-  const [showNote,   setShowNote]   = useState(false)
+  const [showImport,   setShowImport]   = useState(false)
+  const [showScript,   setShowScript]   = useState(false)
+  const [showNote,     setShowNote]     = useState(false)
+  const [showSMS,      setShowSMS]      = useState<Lead|null>(null)
+  const [showEmail,    setShowEmail]    = useState<Lead|null>(null)
+  const [showVoicemail,setShowVoicemail]= useState<Lead|null>(null)
+  const [confirmDelete,setConfirmDelete]= useState<Lead|null>(null)
 
   // Import
   const [importTab, setImportTab] = useState<'single'|'csv'>('single')
@@ -105,6 +126,13 @@ export default function App() {
   const [csvRows, setCsvRows] = useState<any[]>([])
   const [importing, setImporting] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  // Quick compose
+  const [smsText,       setSmsText]       = useState('')
+  const [emailSubject,  setEmailSubject]  = useState('')
+  const [emailBody,     setEmailBody]     = useState('')
+  const [vmScript,      setVmScript]      = useState('')
+  const [sendingAction, setSendingAction] = useState(false)
 
   // Script form
   const [sForm, setSForm] = useState({ name:'', script:'', lead_type:'general', is_default:false })
@@ -158,6 +186,22 @@ export default function App() {
     setTheme(color)
   }
 
+  // ── FILTERED LEADS ────────────────────────────────────────────
+  const filteredLeads = leads
+    .filter(l => {
+      if (filterStage && l.stage !== filterStage) return false
+      if (filterTemp  && l.temperature !== filterTemp) return false
+      if (filterLang  && l.language !== filterLang) return false
+      return true
+    })
+    .sort((a, b) => {
+      if (sortBy === 'created_at') return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      if (sortBy === 'name') return (a.first_name||'').localeCompare(b.first_name||'')
+      if (sortBy === 'temperature') return (a.temperature||'').localeCompare(b.temperature||'')
+      if (sortBy === 'stage') return (a.stage||'').localeCompare(b.stage||'')
+      return 0
+    })
+
   // ── CALL ──────────────────────────────────────────────────────
   async function executeCall(leadId: string) {
     const lead = leads.find(l => l.id === leadId)
@@ -165,22 +209,84 @@ export default function App() {
     if (!lead.phone) { toast('Lead has no phone number', 'warn'); return }
     setCalling(leadId)
     try {
-      const res = await fetch('/api/call', {
+      const res = await fetch('/api/vapi/call', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ leadId, voiceId: selVoice, scriptId: selScript || undefined })
+        body: JSON.stringify({ leadId, forceLanguage: lead.language || 'en' })
       })
       const data = await res.json()
       if (!res.ok) { toast(data.error || 'Call failed', 'err'); return }
-      toast(`📞 Calling ${lead.first_name}…`, 'ok')
+      toast(`📞 Calling ${lead.first_name} in ${(lead.language||'en').toUpperCase()}…`, 'ok')
       setTimeout(loadLeads, 3000)
     } catch(e: any) { toast(e.message, 'err') }
     finally { setCalling(null) }
   }
 
+  // ── DELETE LEAD ───────────────────────────────────────────────
+  async function deleteLead(id: string) {
+    await fetch(`/api/leads/${id}`, { method:'DELETE' })
+    setLeads(l => l.filter(x => x.id !== id))
+    setSelLead(null)
+    setConfirmDelete(null)
+    toast('Lead deleted', 'ok')
+  }
+
+  // ── SEQUENCE TOGGLE ───────────────────────────────────────────
+  async function toggleSequence(lead: Lead) {
+    const isActive = lead.stage === 'contacted'
+    if (isActive) {
+      await patchLead(lead.id, { stage: 'new_lead' })
+      toast(`⏹ Sequence paused for ${lead.first_name}`, 'ok')
+    } else {
+      await patchLead(lead.id, { stage: 'contacted' })
+      toast(`▶ Sequence activated for ${lead.first_name}`, 'ok')
+    }
+  }
+
+  // ── BULK ACTIONS ──────────────────────────────────────────────
+  function toggleSelect(id: string) {
+    setSelectedIds(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
+  function toggleSelectAll() {
+    if (selectedIds.size === filteredLeads.length) setSelectedIds(new Set())
+    else setSelectedIds(new Set(filteredLeads.map(l => l.id)))
+  }
+  async function bulkExport() {
+    const selected = leads.filter(l => selectedIds.has(l.id))
+    const headers = ['first_name','last_name','phone','email','zip_code','language','stage','temperature','called_count','created_at']
+    const rows = selected.map(l => headers.map(h => (l as any)[h]||'').join(','))
+    const csv = [headers.join(','), ...rows].join('\n')
+    const blob = new Blob([csv], { type:'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a'); a.href=url; a.download='leads_export.csv'; a.click()
+    toast('Exported ' + selected.length + ' leads', 'ok')
+  }
+  async function bulkDelete() {
+    if (!confirm('Delete ' + selectedIds.size + ' leads? This cannot be undone.')) return
+    for (const id of selectedIds) await fetch('/api/leads/' + id, { method:'DELETE' })
+    setLeads(l => l.filter(x => !selectedIds.has(x.id)))
+    setSelectedIds(new Set())
+    toast('Leads deleted', 'ok')
+  }
+  async function applyBulkEdit() {
+    if (!bulkStage && !bulkTemp && !bulkLang) { toast('Select at least one field to update','warn'); return }
+    setBulkApplying(true)
+    const updates: Record<string,any> = {}
+    if (bulkStage) updates.stage = bulkStage
+    if (bulkTemp)  updates.temperature = bulkTemp
+    if (bulkLang)  updates.language = bulkLang
+    await Promise.all(Array.from(selectedIds).map(id =>
+      fetch('/api/leads/' + id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(updates) })
+    ))
+    await loadLeads()
+    setSelectedIds(new Set()); setShowBulkEdit(false)
+    setBulkStage(''); setBulkTemp(''); setBulkLang(''); setBulkApplying(false)
+    toast('Updated leads', 'ok')
+  }
+
   // ── OPEN LEAD MODAL ───────────────────────────────────────────
   async function openLead(lead: Lead) {
     setSelLead(lead)
-    const calls = await fetch(`/api/call?leadId=${lead.id}`).then(r=>r.json())
+    const calls = await fetch('/api/call?leadId=' + lead.id).then(r=>r.json())
     setLeadCalls(Array.isArray(calls) ? calls : [])
   }
 
@@ -193,12 +299,66 @@ export default function App() {
 
   async function analyzeLead(id: string) {
     toast('🤖 Analyzing…', 'ok')
-    const res = await fetch(`/api/leads/${id}`, { method:'POST' })
-    const data = await res.json()
-    if (!res.ok) { toast('Analysis failed', 'err'); return }
-    await loadLeads()
-    setSelLead(data)
-    toast('✅ Analysis done', 'ok')
+    try {
+      // Get the lead's call history and qualification data to analyze
+      const lead = leads.find(l => l.id === id)
+      if (!lead) { toast('Lead not found', 'err'); return }
+
+      const callsRes = await fetch(`/api/call?leadId=${id}`)
+      const leadCalls = await callsRes.json()
+
+      // Build context from calls
+      const callSummaries = Array.isArray(leadCalls)
+        ? leadCalls.filter((c:Call) => c.ai_summary).map((c:Call) => c.ai_summary).join('\n')
+        : ''
+      const transcript = Array.isArray(leadCalls)
+        ? leadCalls.filter((c:Call) => c.transcript).map((c:Call) => c.transcript).join('\n')
+        : ''
+
+      const context = `
+Lead: ${lead.first_name} ${lead.last_name}
+Phone: ${lead.phone}
+Language: ${lead.language}
+Stage: ${lead.stage}
+Temperature: ${lead.temperature}
+Credit Score: ${lead.credit_score || 'unknown'}
+Income: ${lead.income || 'unknown'}
+Down Payment: ${lead.down_payment || 'unknown'}
+Looking to Buy: ${lead.looking_to_buy || 'unknown'}
+Call Count: ${lead.called_count || 0}
+Call Summaries: ${callSummaries || 'No calls yet'}
+Recent Transcript: ${transcript?.slice(0,1000) || 'No transcript'}
+      `.trim()
+
+      const res = await fetch('/api/chat', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          message: `Analyze this mortgage lead and provide: 1) A 2-3 sentence qualification summary, 2) Interest level (Hot/Warm/Cold/Not Interested), 3) Next best action. Be specific and actionable.\n\n${context}`,
+          agent: 'sales_manager',
+          history: []
+        })
+      })
+      const data = await res.json()
+      if (!res.ok || !data.reply) { toast('Analysis failed', 'err'); return }
+
+      // Parse the AI response into structured fields
+      const reply = data.reply
+      const updates: Record<string,any> = {
+        ai_analysis: reply,
+        next_action: reply.match(/next best action[:\s]+([^\n.]+)/i)?.[1]?.trim() || '',
+        interest_level: reply.toLowerCase().includes('hot') ? 'hot' :
+                        reply.toLowerCase().includes('warm') ? 'warm' :
+                        reply.toLowerCase().includes('not interested') ? 'not_interested' : 'cold',
+      }
+
+      await fetch(`/api/leads/${id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(updates) })
+      await loadLeads()
+      setSelLead(l => l ? { ...l, ...updates } : l)
+      toast('✅ Analysis complete', 'ok')
+    } catch(e: any) {
+      toast('Analysis failed: ' + e.message, 'err')
+    }
   }
 
   // ── IMPORT ────────────────────────────────────────────────────
@@ -292,7 +452,6 @@ export default function App() {
     toast('✅ Settings saved', 'ok')
     const fresh = await fetch('/api/config').then(r=>r.json())
     setCfg(fresh)
-    // Reload voices in case ElevenLabs voice ID changed
     const v = await fetch('/api/voices').then(r=>r.json())
     setVoices(v); if(v[0] && !selVoice) setSelVoice(v[0].id)
   }
@@ -318,8 +477,6 @@ export default function App() {
     { id:'meeting', icon:'💬', label:'Meeting Room' },
     { id:'settings', icon:'⚙️', label:'Settings' },
   ]
-
-  const STAGES = ['new_lead','contacted','appointment_set','doc_request','pre_approved','closed_won']
 
   // ── RENDER ────────────────────────────────────────────────────
   return (
@@ -396,16 +553,50 @@ export default function App() {
         {/* ── CONVERSION ── */}
         {view==='conversion' && (
           <div>
-            <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:14, flexWrap:'wrap' }}>
-              <select value={selVoice} onChange={e=>setSelVoice(e.target.value)} style={{ ...S.select, minWidth:180 }}>
-                {voices.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
+
+
+            {/* FILTERS */}
+            <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom:14, flexWrap:'wrap', background:'#111827', border:'1px solid rgba(255,255,255,.08)', borderRadius:10, padding:'10px 14px' }}>
+              <span style={{ fontSize:12, color:'#4b6080', fontWeight:700 }}>FILTER:</span>
+              <select value={filterStage} onChange={e=>setFilterStage(e.target.value)} style={{ ...S.select, fontSize:12, padding:'5px 8px' }}>
+                <option value="">All Stages</option>
+                {STAGES.map(s=><option key={s} value={s}>{STAGE_PILLS[s]?.label||s}</option>)}
               </select>
-              <select value={selScript} onChange={e=>setSelScript(e.target.value)} style={{ ...S.select, minWidth:160 }}>
-                <option value="">Default script</option>
-                {scripts.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+              <select value={filterTemp} onChange={e=>setFilterTemp(e.target.value)} style={{ ...S.select, fontSize:12, padding:'5px 8px' }}>
+                <option value="">All Temps</option>
+                <option value="hot">🔥 Hot</option>
+                <option value="warm">🟡 Warm</option>
+                <option value="cold">❄️ Cold</option>
               </select>
-              <button style={{ ...S.btnOutline, ...S.btnSm }} onClick={()=>setShowScript(true)}>+ Script</button>
+              <select value={filterLang} onChange={e=>setFilterLang(e.target.value)} style={{ ...S.select, fontSize:12, padding:'5px 8px' }}>
+                <option value="">All Languages</option>
+                <option value="en">🇺🇸 English</option>
+                <option value="es">🇪🇸 Spanish</option>
+              </select>
+              <span style={{ fontSize:12, color:'#4b6080', fontWeight:700, marginLeft:8 }}>SORT:</span>
+              <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{ ...S.select, fontSize:12, padding:'5px 8px' }}>
+                <option value="created_at">Date Added</option>
+                <option value="name">Name</option>
+                <option value="temperature">Temperature</option>
+                <option value="stage">Stage</option>
+              </select>
+              {(filterStage||filterTemp||filterLang) && (
+                <button onClick={()=>{setFilterStage('');setFilterTemp('');setFilterLang('')}} style={{ ...S.btnOutline, ...S.btnSm, fontSize:11, color:'#ef4444', borderColor:'rgba(239,68,68,.3)' }}>Clear ×</button>
+              )}
+              <span style={{ marginLeft:'auto', fontSize:12, color:'#4b6080' }}>{filteredLeads.length} of {leads.length} leads</span>
             </div>
+
+            {/* BULK ACTION BAR */}
+            {selectedIds.size > 0 && (
+              <div style={{ display:'flex', gap:8, alignItems:'center', background:'rgba(59,130,246,.1)', border:'1px solid rgba(59,130,246,.3)', borderRadius:10, padding:'10px 14px', marginBottom:14 }}>
+                <span style={{ fontSize:13, fontWeight:700, color:'#60a5fa' }}>{selectedIds.size} lead{selectedIds.size!==1?'s':''} selected</span>
+                <button onClick={()=>setShowBulkEdit(true)} style={{ ...S.btnPrimary, ...S.btnSm }}>✏️ Edit Fields</button>
+                <button onClick={bulkExport} style={{ ...S.btnOutline, ...S.btnSm }}>⬇ Export</button>
+                <button onClick={bulkDelete} style={{ ...S.btnSm, background:'rgba(239,68,68,.15)', border:'1px solid rgba(239,68,68,.3)', borderRadius:7, color:'#ef4444', cursor:'pointer', fontFamily:'Arial,sans-serif' }}>🗑 Delete</button>
+                <button onClick={()=>setSelectedIds(new Set())} style={{ ...S.btnOutline, ...S.btnSm, marginLeft:'auto' }}>Clear</button>
+              </div>
+            )}
+
             <div style={{ ...S.grid4, marginBottom:14 }}>
               {[['Total',leads.length,'#60a5fa'],['Hot',hot,'#ef4444'],['New Today',today,'#22c55e'],['Called',called,'#f59e0b']].map(([l,v,c])=>(
                 <div key={l as string} style={S.statBox}><div style={S.statLabel}>{l}</div><div style={{ ...S.statVal, color:c as string, fontSize:20 }}>{v}</div></div>
@@ -417,22 +608,41 @@ export default function App() {
                 <input placeholder="Search name, phone…" style={{ ...S.input, width:200 }} onInput={(e:any)=>{ setSearch(e.target.value); loadLeads(e.target.value) }} />
               </div>
               <table style={S.tbl}>
-                <thead><tr>{['Name','Stage','Source','Temperature','Called','Actions'].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                <thead><tr>
+                  <th style={{ ...S.th, width:40, textAlign:'center' }}>
+                    <input type="checkbox" checked={selectedIds.size===filteredLeads.length&&filteredLeads.length>0} onChange={toggleSelectAll}
+                      style={{ cursor:'pointer', accentColor:'#3b82f6', width:14, height:14 }} />
+                  </th>
+                  {['Name','Language','Stage','Temperature','Date Added','Called','Actions'].map(h=><th key={h} style={S.th}>{h}</th>)}
+                </tr></thead>
                 <tbody>
-                  {!leads.length && <tr><td colSpan={6} style={{ ...S.td, textAlign:'center', color:'#4b6080', padding:24 }}>No leads yet — import some above</td></tr>}
-                  {leads.map(l => {
+                  {!filteredLeads.length && <tr><td colSpan={7} style={{ ...S.td, textAlign:'center', color:'#4b6080', padding:24 }}>No leads match filters</td></tr>}
+                  {filteredLeads.map(l => {
                     const sp = STAGE_PILLS[l.stage]||STAGE_PILLS.new_lead
+                    const seqActive = l.stage === 'contacted'
                     return (
-                      <tr key={l.id} style={{ cursor:'pointer' }} onClick={()=>openLead(l)}>
-                        <td style={S.td}><strong>{l.first_name} {l.last_name}</strong><div style={{ fontSize:11, color:'#4b6080' }}>{l.phone||l.email||'—'}</div></td>
+                      <tr key={l.id} style={{ background: selectedIds.has(l.id)?'rgba(59,130,246,.06)':'transparent' }}>
+                        <td style={{ ...S.td, textAlign:'center', width:40 }} onClick={e=>e.stopPropagation()}>
+                          <input type="checkbox" checked={selectedIds.has(l.id)} onChange={()=>toggleSelect(l.id)}
+                            style={{ cursor:'pointer', accentColor:'#3b82f6', width:14, height:14 }} />
+                        </td>
+                        <td style={{ ...S.td, cursor:'pointer' }} onClick={()=>openLead(l)}><strong>{l.first_name} {l.last_name}</strong><div style={{ fontSize:11, color:'#4b6080' }}>{l.phone||l.email||'—'}</div></td>
+                        <td style={S.td}><span style={{ fontSize:13 }}>{l.language==='es'?'🇪🇸':'🇺🇸'}</span></td>
                         <td style={S.td}><span style={{ display:'inline-block', padding:'3px 9px', borderRadius:12, fontSize:11, fontWeight:700, background:sp.bg, color:sp.color }}>{sp.label}</span></td>
-                        <td style={{ ...S.td, fontSize:12, color:'#94a3b8' }}>{l.source||'—'}</td>
                         <td style={S.td}><span style={{ fontSize:12, fontWeight:700, color:TEMP_COLOR[l.temperature]||'#94a3b8' }}>{l.temperature||'cold'}</span></td>
+                        <td style={{ ...S.td, fontSize:11, color:'#4b6080' }}>{new Date(l.created_at).toLocaleDateString()}</td>
                         <td style={{ ...S.td, fontSize:12, color:'#94a3b8' }}>{l.called_count||0}x</td>
                         <td style={S.td} onClick={e=>e.stopPropagation()}>
-                          <div style={{ display:'flex', gap:5 }}>
-                            <button disabled={calling===l.id} onClick={()=>executeCall(l.id)} style={{ ...S.btnPrimary, ...S.btnSm }}>{calling===l.id?'⏳…':'📞 Call'}</button>
-                            <button style={{ ...S.btnOutline, ...S.btnSm }} onClick={()=>openLead(l)}>View</button>
+                          <div style={{ display:'flex', gap:5, flexWrap:'wrap' }}>
+                            <button disabled={calling===l.id} onClick={()=>executeCall(l.id)} style={{ ...S.btnPrimary, ...S.btnSm }}>{calling===l.id?'⏳':'📞'}</button>
+                            <button title="SMS" onClick={()=>setShowSMS(l)} style={{ ...S.btnOutline, ...S.btnSm }}>💬</button>
+                            <button title="Email" onClick={()=>setShowEmail(l)} style={{ ...S.btnOutline, ...S.btnSm }}>📧</button>
+                            <button title="Voicemail" onClick={()=>setShowVoicemail(l)} style={{ ...S.btnOutline, ...S.btnSm }}>📱</button>
+                            <button title={seqActive?'Pause Sequence':'Activate Sequence'} onClick={()=>toggleSequence(l)}
+                              style={{ ...S.btnSm, background: seqActive?'rgba(34,197,94,.15)':'rgba(255,255,255,.06)', border:`1px solid ${seqActive?'rgba(34,197,94,.4)':'rgba(255,255,255,.14)'}`, borderRadius:7, color:seqActive?'#22c55e':'#94a3b8', cursor:'pointer', fontFamily:'Arial,sans-serif' }}>
+                              {seqActive?'⏸':'▶'}
+                            </button>
+                            <button title="Delete Lead" onClick={()=>setConfirmDelete(l)} style={{ ...S.btnSm, background:'rgba(239,68,68,.1)', border:'1px solid rgba(239,68,68,.3)', borderRadius:7, color:'#ef4444', cursor:'pointer', fontFamily:'Arial,sans-serif' }}>🗑</button>
                           </div>
                         </td>
                       </tr>
@@ -465,7 +675,10 @@ export default function App() {
                           <div style={{ fontSize:13, fontWeight:700 }}>{l.first_name} {l.last_name}</div>
                           {l.loan_amount && <div style={{ fontSize:12, color:'#f59e0b', fontWeight:700 }}>${parseFloat(l.loan_amount||'0').toLocaleString()}</div>}
                           <div style={{ fontSize:11, color:'#4b6080', marginTop:3 }}>{l.phone||l.email||'—'}</div>
-                          <div style={{ marginTop:5 }}><span style={{ fontSize:10, fontWeight:700, color:TEMP_COLOR[l.temperature]||'#94a3b8' }}>● {l.temperature||'cold'}</span></div>
+                          <div style={{ marginTop:5, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                            <span style={{ fontSize:10, fontWeight:700, color:TEMP_COLOR[l.temperature]||'#94a3b8' }}>● {l.temperature||'cold'}</span>
+                            <span style={{ fontSize:10 }}>{l.language==='es'?'🇪🇸':'🇺🇸'}</span>
+                          </div>
                         </div>
                       ))}
                       {!stageLeads.length && <div style={{ fontSize:11, color:'#4b6080', textAlign:'center', padding:12 }}>Drop here</div>}
@@ -481,7 +694,6 @@ export default function App() {
         {view==='meeting' && (
           <div style={{ display:'grid', gridTemplateColumns:'1fr 280px', gap:16, height:'calc(100vh - 94px)' }}>
             <div style={{ display:'flex', flexDirection:'column', gap:12, overflow:'hidden' }}>
-              {/* Agent selector */}
               <div style={S.card}>
                 <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                   <div style={{ display:'flex', gap:20, alignItems:'center' }}>
@@ -499,7 +711,6 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              {/* Tabs */}
               <div style={{ display:'flex', gap:4, background:'#1a2540', borderRadius:8, padding:3, flexShrink:0 }}>
                 {(['chat','training'] as const).map(t=>(
                   <button key={t} onClick={()=>setMeetingTab(t)} style={{ flex:1, padding:7, borderRadius:6, border:'none', background:meetingTab===t?'#111827':'transparent', color:meetingTab===t?'#e8edf5':'#94a3b8', fontSize:13, cursor:'pointer', fontFamily:'Arial,sans-serif', fontWeight:meetingTab===t?700:400 }}>
@@ -507,7 +718,6 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              {/* Chat */}
               {meetingTab==='chat' && (
                 <div style={{ ...S.card, flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
                   <div ref={msgsRef} style={{ flex:1, overflowY:'auto', display:'flex', flexDirection:'column', gap:12, paddingBottom:4 }}>
@@ -540,7 +750,6 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {/* Training Notes */}
               {meetingTab==='training' && (
                 <div style={{ ...S.card, flex:1, overflowY:'auto' }}>
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
@@ -548,7 +757,7 @@ export default function App() {
                     <button style={{ ...S.btnPrimary, ...S.btnSm }} onClick={()=>setShowNote(true)}>+ Add Note</button>
                   </div>
                   <div style={{ fontSize:12, color:'#4b6080', marginBottom:14 }}>Notes are fed to your AI agents on every call and chat.</div>
-                  {!notes.length && <div style={{ color:'#4b6080', fontSize:13 }}>No notes yet. Add objection responses, market knowledge, scripts.</div>}
+                  {!notes.length && <div style={{ color:'#4b6080', fontSize:13 }}>No notes yet.</div>}
                   {notes.map(n=>(
                     <div key={n.id} style={{ background:'#1a2540', border:'1px solid rgba(255,255,255,.08)', borderRadius:8, padding:12, marginBottom:10 }}>
                       <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
@@ -561,7 +770,6 @@ export default function App() {
                 </div>
               )}
             </div>
-            {/* Daily Summary */}
             <div style={{ ...S.card, overflowY:'auto' }}>
               <div style={S.cardTitle}>Today's Summary</div>
               {[['Total Leads',leads.length,'#60a5fa'],['Hot Leads',hot,'#ef4444'],['New Today',today,'#22c55e'],['Called',called,'#f59e0b']].map(([l,v,c])=>(
@@ -579,17 +787,13 @@ export default function App() {
           <div style={S.grid2}>
             <div style={S.card}>
               <div style={S.cardTitle}>API Keys</div>
-              {[['cfg-anthropic','Anthropic API Key','password','sk-ant-…'],['cfg-twilio-sid','Twilio Account SID','text','ACxxxxxxxx'],['cfg-twilio-token','Twilio Auth Token','password','Auth Token'],['cfg-twilio-phone','Twilio Phone Number','text','+15550000000'],['cfg-el-key','ElevenLabs API Key','password','xi-api-key…'],['cfg-el-voice','ElevenLabs Voice ID','text','e.g. pNInz6obpgDQGcFmaJgB'],
-              ['cfg-relay','Relay Server URL (for natural AI calls)','text','https://jordanai-relay.up.railway.app']].map(([id,label,type,ph])=>(
+              {[['cfg-anthropic','Anthropic API Key','password','sk-ant-…'],['cfg-twilio-sid','Twilio Account SID','text','ACxxxxxxxx'],['cfg-twilio-token','Twilio Auth Token','password','Auth Token'],['cfg-twilio-phone','Twilio Phone Number','text','+15550000000'],['cfg-el-key','ElevenLabs API Key','password','xi-api-key…'],['cfg-el-voice','ElevenLabs Voice ID','text','e.g. pNInz6obpgDQGcFmaJgB']].map(([id,label,type,ph])=>(
                 <div key={id} style={S.field}>
                   <label style={S.label}>{label}</label>
                   <input type={type} placeholder={(cfg as any)[id.replace('cfg-','').replace('-','_').toUpperCase()]||ph as string}
                     value={cfgInputs[id]||''} onChange={e=>setCfgInputs(c=>({...c,[id]:e.target.value}))} style={S.input} />
                 </div>
               ))}
-              <div style={{ background:'rgba(245,158,11,.08)', border:'1px solid rgba(245,158,11,.25)', borderRadius:8, padding:12, fontSize:12, color:'#f59e0b', marginBottom:14 }}>
-                ⚠️ <strong>Twilio Trial?</strong> You can only call verified numbers. Go to <a href="https://console.twilio.com/us1/develop/phone-numbers/manage/verified" target="_blank" style={{ color:'#f59e0b' }}>Verified Caller IDs</a> to add your number, or add credit to call anyone.
-              </div>
               <button style={S.btnPrimary} onClick={saveSettings}>Save All Keys</button>
             </div>
             <div style={S.card}>
@@ -600,10 +804,8 @@ export default function App() {
                     style={{ width:30, height:30, borderRadius:'50%', background:c, cursor:'pointer', border:theme===c?'3px solid #fff':'3px solid transparent' }} />
                 ))}
               </div>
-              <input type="color" value={theme} onChange={e=>{ applyTheme(e.target.value); fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({THEME_COLOR:e.target.value})}) }}
-                style={{ width:40, height:40, borderRadius:8, border:'1px solid rgba(255,255,255,.14)', cursor:'pointer', background:'none', padding:2 }} />
               <div style={{ ...S.cardTitle, marginTop:20 }}>Connection Status</div>
-              {[['Anthropic AI',cfg.ANTHROPIC_API_KEY==='✓ Set'],['Twilio',cfg.TWILIO_ACCOUNT_SID==='✓ Set'],['ElevenLabs',cfg.ELEVENLABS_API_KEY==='✓ Set'],['Meta Ads',!!cfg.META_ACCESS_TOKEN]].map(([n,ok])=>(
+              {[['Anthropic AI',cfg.ANTHROPIC_API_KEY==='✓ Set'],['Twilio',cfg.TWILIO_ACCOUNT_SID==='✓ Set'],['ElevenLabs',cfg.ELEVENLABS_API_KEY==='✓ Set']].map(([n,ok])=>(
                 <div key={n as string} style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid rgba(255,255,255,.06)', fontSize:13 }}>
                   <span>{n as string}</span>
                   <span style={{ fontWeight:700, color:ok?'#22c55e':'#f59e0b' }}>{ok?'✅ Connected':'⚠️ Not set'}</span>
@@ -613,8 +815,8 @@ export default function App() {
           </div>
         )}
 
-        </div>{/* /content */}
-      </div>{/* /main */}
+        </div>
+      </div>
 
       {/* ── MODALS ── */}
 
@@ -674,6 +876,129 @@ export default function App() {
         </div>
       )}
 
+      {/* SMS MODAL */}
+      {showSMS && (
+        <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowSMS(null)}}>
+          <div style={{ ...S.modal, width:460 }}>
+            <div style={S.modalHead}>
+              <div style={S.modalTitle}>Send SMS to {showSMS.first_name}</div>
+              <button style={S.closeBtn} onClick={()=>setShowSMS(null)}>×</button>
+            </div>
+            <div style={{ fontSize:12, color:'#4b6080', marginBottom:12 }}>📱 {showSMS.phone}</div>
+            <div style={S.field}>
+              <label style={S.label}>Message</label>
+              <textarea value={smsText} onChange={e=>setSmsText(e.target.value)} rows={4}
+                placeholder={`Hi ${showSMS.first_name}, this is Vero from Dream Key Lending Group. Following up on your interest in buying a home. Reply STOP to opt out.`}
+                style={{ ...S.input, resize:'vertical', lineHeight:1.6 }} />
+              <div style={{ fontSize:11, color:'#4b6080', marginTop:4, textAlign:'right' }}>{smsText.length}/160</div>
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button style={{ ...S.btnPrimary, flex:1, padding:10 }} disabled={sendingAction||!smsText.trim()} onClick={async()=>{
+                setSendingAction(true)
+                try {
+                  await fetch('/api/sms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ to: showSMS.phone, message: smsText, leadId: showSMS.id }) })
+                  toast(`✅ SMS sent to ${showSMS.first_name}`, 'ok')
+                  setSmsText(''); setShowSMS(null)
+                } catch(e:any) { toast('SMS failed: ' + e.message, 'err') }
+                finally { setSendingAction(false) }
+              }}>{sendingAction ? 'Sending…' : '📤 Send SMS'}</button>
+              <button style={{ ...S.btnOutline, padding:10 }} onClick={()=>setShowSMS(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* EMAIL MODAL */}
+      {showEmail && (
+        <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowEmail(null)}}>
+          <div style={{ ...S.modal, width:520 }}>
+            <div style={S.modalHead}>
+              <div style={S.modalTitle}>Send Email to {showEmail.first_name}</div>
+              <button style={S.closeBtn} onClick={()=>setShowEmail(null)}>×</button>
+            </div>
+            <div style={{ fontSize:12, color:'#4b6080', marginBottom:12 }}>📧 {showEmail.email||'No email on file'}</div>
+            <div style={S.field}>
+              <label style={S.label}>Subject</label>
+              <input value={emailSubject} onChange={e=>setEmailSubject(e.target.value)}
+                placeholder="Your home buying journey starts here"
+                style={S.input} />
+            </div>
+            <div style={S.field}>
+              <label style={S.label}>Message</label>
+              <textarea value={emailBody} onChange={e=>setEmailBody(e.target.value)} rows={6}
+                placeholder={`Hi ${showEmail.first_name},\n\nThis is Vero from Dream Key Lending Group. We saw you expressed interest in buying a home and wanted to follow up.\n\nBest,\nVero`}
+                style={{ ...S.input, resize:'vertical', lineHeight:1.6 }} />
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button style={{ ...S.btnPrimary, flex:1, padding:10 }} disabled={sendingAction||!emailBody.trim()||!showEmail.email} onClick={async()=>{
+                setSendingAction(true)
+                try {
+                  await fetch('/api/email', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ to: showEmail.email, subject: emailSubject, body: emailBody, leadId: showEmail.id }) })
+                  toast(`✅ Email sent to ${showEmail.first_name}`, 'ok')
+                  setEmailSubject(''); setEmailBody(''); setShowEmail(null)
+                } catch(e:any) { toast('Email failed: ' + e.message, 'err') }
+                finally { setSendingAction(false) }
+              }}>{sendingAction ? 'Sending…' : '📤 Send Email'}</button>
+              <button style={{ ...S.btnOutline, padding:10 }} onClick={()=>setShowEmail(null)}>Cancel</button>
+            </div>
+            {!showEmail.email && <div style={{ fontSize:12, color:'#f59e0b', marginTop:8 }}>⚠️ No email address on file for this lead.</div>}
+          </div>
+        </div>
+      )}
+
+      {/* VOICEMAIL MODAL */}
+      {showVoicemail && (
+        <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowVoicemail(null)}}>
+          <div style={{ ...S.modal, width:460 }}>
+            <div style={S.modalHead}>
+              <div style={S.modalTitle}>Drop Voicemail to {showVoicemail.first_name}</div>
+              <button style={S.closeBtn} onClick={()=>setShowVoicemail(null)}>×</button>
+            </div>
+            <div style={{ fontSize:12, color:'#4b6080', marginBottom:12 }}>📞 {showVoicemail.phone}</div>
+            <div style={{ background:'rgba(59,130,246,.08)', border:'1px solid rgba(59,130,246,.2)', borderRadius:8, padding:12, fontSize:12, color:'#60a5fa', marginBottom:14 }}>
+              ℹ️ AI will call and leave a pre-recorded voicemail if no answer.
+            </div>
+            <div style={S.field}>
+              <label style={S.label}>Voicemail Script</label>
+              <textarea value={vmScript} onChange={e=>setVmScript(e.target.value)} rows={5}
+                placeholder={`Hi ${showVoicemail.first_name}, this is Vero from Dream Key Lending Group. I'm calling about your interest in buying a home. We have some great programs that could work for you. Please call us back or reply to this message. Have a great day!`}
+                style={{ ...S.input, resize:'vertical', lineHeight:1.6 }} />
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button style={{ ...S.btnPrimary, flex:1, padding:10 }} disabled={sendingAction} onClick={async()=>{
+                setSendingAction(true)
+                try {
+                  await fetch('/api/vapi/call', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ leadId: showVoicemail.id, forceLanguage: showVoicemail.language||'en', voicemailMode: true, script: vmScript }) })
+                  toast(`✅ Voicemail drop initiated for ${showVoicemail.first_name}`, 'ok')
+                  setVmScript(''); setShowVoicemail(null)
+                } catch(e:any) { toast('Voicemail failed: ' + e.message, 'err') }
+                finally { setSendingAction(false) }
+              }}>{sendingAction ? 'Dropping…' : '📱 Drop Voicemail'}</button>
+              <button style={{ ...S.btnOutline, padding:10 }} onClick={()=>setShowVoicemail(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DELETE CONFIRM */}
+      {confirmDelete && (
+        <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setConfirmDelete(null)}}>
+          <div style={{ ...S.modal, width:380 }}>
+            <div style={S.modalHead}>
+              <div style={S.modalTitle}>Delete Lead</div>
+              <button style={S.closeBtn} onClick={()=>setConfirmDelete(null)}>×</button>
+            </div>
+            <div style={{ fontSize:13, color:'#94a3b8', marginBottom:20, lineHeight:1.6 }}>
+              Are you sure you want to delete <strong style={{ color:'#e8edf5' }}>{confirmDelete.first_name} {confirmDelete.last_name}</strong>? This will remove all their data including call history. This cannot be undone.
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button style={{ ...S.btnDanger, flex:1, padding:10, fontSize:13 }} onClick={()=>deleteLead(confirmDelete.id)}>Yes, Delete</button>
+              <button style={{ ...S.btnOutline, flex:1, padding:10 }} onClick={()=>setConfirmDelete(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* SCRIPT EDITOR */}
       {showScript && (
         <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowScript(false)}}>
@@ -687,8 +1012,7 @@ export default function App() {
             </div>
             <div style={S.field}>
               <label style={S.label}>Script</label>
-              <div style={{ fontSize:11, color:'#4b6080', marginBottom:6 }}>Use [LEAD_NAME] and [AGENT_NAME] as placeholders.</div>
-              <textarea value={sForm.script} onChange={e=>setSForm(f=>({...f,script:e.target.value}))} rows={10} style={{ ...S.input, lineHeight:1.6, resize:'vertical' }} placeholder={`Hi, is this [LEAD_NAME]?\n\nGreat! My name is [AGENT_NAME] and I'm calling about your interest in home financing. Do you have a couple minutes?`} />
+              <textarea value={sForm.script} onChange={e=>setSForm(f=>({...f,script:e.target.value}))} rows={10} style={{ ...S.input, lineHeight:1.6, resize:'vertical' }} placeholder="Use [LEAD_NAME] and [AGENT_NAME] as placeholders." />
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
               <input type="checkbox" id="def" checked={sForm.is_default} onChange={e=>setSForm(f=>({...f,is_default:e.target.checked}))} />
@@ -703,17 +1027,6 @@ export default function App() {
               }}>Save Script</button>
               <button style={{ ...S.btnOutline, flex:1, padding:10 }} onClick={()=>setShowScript(false)}>Cancel</button>
             </div>
-            {scripts.length>0 && (
-              <div style={{ marginTop:16, borderTop:'1px solid rgba(255,255,255,.08)', paddingTop:14 }}>
-                <div style={{ fontSize:12, color:'#94a3b8', marginBottom:8, fontWeight:700 }}>Your Scripts</div>
-                {scripts.map(s=>(
-                  <div key={s.id} style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:'1px solid rgba(255,255,255,.06)', alignItems:'center' }}>
-                    <div><span style={{ fontSize:13, fontWeight:700 }}>{s.name}</span>{s.is_default&&<span style={{ marginLeft:8, fontSize:10, padding:'2px 7px', borderRadius:10, background:'rgba(34,197,94,.15)', color:'#22c55e', fontWeight:700 }}>Default</span>}</div>
-                    <button onClick={async()=>{ await fetch(`/api/scripts?id=${s.id}`,{method:'DELETE'}); const ns=await fetch('/api/scripts').then(r=>r.json()); setScripts(ns); toast('Deleted','ok') }} style={S.btnDanger}>Delete</button>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         </div>
       )}
@@ -723,13 +1036,13 @@ export default function App() {
         <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowNote(false)}}>
           <div style={{ ...S.modal, width:500 }}>
             <div style={S.modalHead}><div style={S.modalTitle}>Add Training Note</div><button style={S.closeBtn} onClick={()=>setShowNote(false)}>×</button></div>
-            <div style={S.field}><label style={S.label}>Title</label><input value={nForm.title} onChange={e=>setNForm(f=>({...f,title:e.target.value}))} style={S.input} placeholder="e.g. Handling 'I need to think about it'" /></div>
+            <div style={S.field}><label style={S.label}>Title</label><input value={nForm.title} onChange={e=>setNForm(f=>({...f,title:e.target.value}))} style={S.input} /></div>
             <div style={S.field}><label style={S.label}>Category</label>
               <select value={nForm.category} onChange={e=>setNForm(f=>({...f,category:e.target.value}))} style={{ ...S.select, width:'100%' }}>
                 {['general','objections','scripts','market','compliance'].map(c=><option key={c}>{c}</option>)}
               </select>
             </div>
-            <div style={S.field}><label style={S.label}>Content</label><textarea value={nForm.content} onChange={e=>setNForm(f=>({...f,content:e.target.value}))} rows={8} style={{ ...S.input, resize:'vertical', lineHeight:1.6 }} placeholder="Write your training content. AI agents use this on every call and chat." /></div>
+            <div style={S.field}><label style={S.label}>Content</label><textarea value={nForm.content} onChange={e=>setNForm(f=>({...f,content:e.target.value}))} rows={8} style={{ ...S.input, resize:'vertical', lineHeight:1.6 }} /></div>
             <div style={{ display:'flex', gap:8 }}>
               <button style={{ ...S.btnPrimary, flex:1, padding:10 }} onClick={async()=>{
                 if(!nForm.title||!nForm.content){toast('Title and content required','warn');return}
@@ -746,21 +1059,27 @@ export default function App() {
       {/* LEAD DETAIL */}
       {selLead && (
         <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setSelLead(null)}}>
-          <div style={{ ...S.modal, width:620 }}>
+          <div style={{ ...S.modal, width:640 }}>
             <div style={S.modalHead}>
               <div>
                 <div style={S.modalTitle}>{selLead.first_name} {selLead.last_name}</div>
                 {(() => { const sp=STAGE_PILLS[selLead.stage]||STAGE_PILLS.new_lead; return <span style={{ display:'inline-block', marginTop:4, padding:'3px 9px', borderRadius:12, fontSize:11, fontWeight:700, background:sp.bg, color:sp.color }}>{sp.label}</span> })()}
               </div>
-              <button style={S.closeBtn} onClick={()=>setSelLead(null)}>×</button>
+              <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                <button onClick={()=>{setSelLead(null);setConfirmDelete(selLead)}} style={{ ...S.btnSm, background:'rgba(239,68,68,.1)', border:'1px solid rgba(239,68,68,.3)', borderRadius:7, color:'#ef4444', cursor:'pointer', fontFamily:'Arial,sans-serif' }}>🗑 Delete</button>
+                <button style={S.closeBtn} onClick={()=>setSelLead(null)}>×</button>
+              </div>
             </div>
             {/* Call bar */}
             <div style={{ background:'#1a2540', borderRadius:8, padding:12, marginBottom:14, display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
               <button disabled={calling===selLead.id} onClick={()=>executeCall(selLead.id)} style={{ ...S.btnPrimary, padding:'9px 20px' }}>
                 {calling===selLead.id?'⏳ Dialing…':'📞 Execute AI Call'}
               </button>
+              <button onClick={()=>{setSelLead(null);setShowSMS(selLead)}} style={{ ...S.btnOutline, ...S.btnSm }}>💬 SMS</button>
+              <button onClick={()=>{setSelLead(null);setShowEmail(selLead)}} style={{ ...S.btnOutline, ...S.btnSm }}>📧 Email</button>
+              <button onClick={()=>{setSelLead(null);setShowVoicemail(selLead)}} style={{ ...S.btnOutline, ...S.btnSm }}>📱 Voicemail</button>
               <div style={{ fontSize:12, color:'#94a3b8' }}>
-                Voice: {voices.find(v=>v.id===selVoice)?.name||'Default'} · Called: {selLead.called_count||0}x
+                {selLead.language==='es'?'🇪🇸 Spanish':'🇺🇸 English'} · Called: {selLead.called_count||0}x
               </div>
               {(selLead.lead_rating||0)>0 && (
                 <div style={{ marginLeft:'auto', textAlign:'center' }}>
@@ -770,12 +1089,22 @@ export default function App() {
               )}
             </div>
             <div style={{ ...S.grid2, gap:14, marginBottom:14 }}>
-              {/* Contact + Qualifying */}
               <div>
                 <div style={{ fontSize:11, color:'#4b6080', fontWeight:700, textTransform:'uppercase', letterSpacing:.5, marginBottom:8 }}>Contact Info</div>
-                {[['Phone',selLead.phone],['Email',selLead.email],['Zip',selLead.zip_code],['Source',selLead.source],['Language',selLead.language==='es'?'🇪🇸 Spanish':'🇺🇸 English'],['Called',selLead.called_count+'x'],['Last Called',selLead.last_called?new Date(selLead.last_called).toLocaleDateString():'Never']].filter(([,v])=>v).map(([k,v])=>(
+                {/* Read-only fields */}
+                {[
+                  ['Phone', selLead.phone],
+                  ['Email', selLead.email],
+                  ['Zip', selLead.zip_code],
+                  ['Source', selLead.source],
+                  ['Language', selLead.language==='es'?'🇪🇸 Spanish':'🇺🇸 English'],
+                  ['Status', selLead.temperature || 'cold'],
+                  ['Date Added', selLead.created_at ? new Date(selLead.created_at).toLocaleDateString() : '—'],
+                  ['Last Called', selLead.last_called ? new Date(selLead.last_called).toLocaleDateString() : 'Never'],
+                ].filter(([,v])=>v).map(([k,v])=>(
                   <div key={k} style={{ display:'flex', justifyContent:'space-between', padding:'5px 0', borderBottom:'1px solid rgba(255,255,255,.06)', fontSize:12 }}>
-                    <span style={{ color:'#4b6080' }}>{k}</span><span style={{ fontWeight:700 }}>{v}</span>
+                    <span style={{ color:'#4b6080' }}>{k}</span>
+                    <span style={{ fontWeight:700, color: k==='Status' ? (TEMP_COLOR[v as string]||'#94a3b8') : '#e8edf5' }}>{v}</span>
                   </div>
                 ))}
                 <div style={{ fontSize:11, color:'#4b6080', fontWeight:700, textTransform:'uppercase', letterSpacing:.5, margin:'12px 0 8px' }}>
@@ -800,7 +1129,7 @@ export default function App() {
               {/* AI Analysis */}
               <div>
                 <div style={{ fontSize:11, color:'#4b6080', fontWeight:700, textTransform:'uppercase', letterSpacing:.5, marginBottom:8 }}>AI Analysis</div>
-                <div style={{ background:'#1a2540', borderRadius:8, padding:10, fontSize:12, lineHeight:1.6, color:'#94a3b8', marginBottom:10 }}>
+                <div style={{ background:'#1a2540', borderRadius:8, padding:10, fontSize:12, lineHeight:1.6, color:'#94a3b8', marginBottom:10, minHeight:60 }}>
                   {selLead.ai_analysis||'No analysis yet — execute a call to qualify.'}
                 </div>
                 {selLead.next_action && (
@@ -812,7 +1141,7 @@ export default function App() {
                 {selLead.interest_level && (
                   <div style={{ background:'#1a2540', borderRadius:8, padding:10, fontSize:12, color:'#94a3b8' }}>
                     <div style={{ fontSize:10, color:'#4b6080', fontWeight:700, marginBottom:4, textTransform:'uppercase' }}>Interest Level</div>
-                    "{selLead.interest_level}"
+                    <span style={{ fontWeight:700, color: TEMP_COLOR[selLead.interest_level]||'#94a3b8' }}>"{selLead.interest_level}"</span>
                   </div>
                 )}
               </div>
@@ -826,10 +1155,14 @@ export default function App() {
                     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
                       <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
                         <span style={{ fontSize:12, fontWeight:700 }}>📞 {new Date(c.created_at).toLocaleString()}</span>
-                        <span style={{ fontSize:11, padding:'2px 8px', borderRadius:10, fontWeight:700, background: c.status==='completed'?'rgba(34,197,94,.15)':c.status==='no_answer'?'rgba(245,158,11,.15)':'rgba(59,130,246,.1)', color: c.status==='completed'?'#22c55e':c.status==='no_answer'?'#f59e0b':'#60a5fa' }}>{c.status}</span>
-                        {(c.ai_rating||0)>0 && <span style={{ fontSize:13, fontWeight:700, color:rating(c.ai_rating||0) }}>{c.ai_rating}/10</span>}
+                        <span style={{ fontSize:11, padding:'2px 8px', borderRadius:10, fontWeight:700,
+                          background: c.status==='completed'?'rgba(34,197,94,.15)':c.status==='no_answer'?'rgba(245,158,11,.15)':'rgba(59,130,246,.1)',
+                          color: c.status==='completed'?'#22c55e':c.status==='no_answer'?'#f59e0b':'#60a5fa' }}>{c.status}</span>
+                        {c.disposition && <span style={{ fontSize:11, padding:'2px 8px', borderRadius:10, fontWeight:700, background:'rgba(59,130,246,.1)', color:'#60a5fa' }}>{c.disposition}</span>}
                       </div>
-                      <span style={{ fontSize:11, color:'#4b6080' }}>{c.duration?Math.round(c.duration/60)+'m '+c.duration%60+'s':''}</span>
+                      <span style={{ fontSize:11, color:'#4b6080' }}>
+                        {c.duration_seconds ? Math.floor(c.duration_seconds/60)+'m '+(c.duration_seconds%60)+'s' : c.duration ? Math.round(c.duration/60)+'m '+c.duration%60+'s' : ''}
+                      </span>
                     </div>
                     {c.ai_summary && <div style={{ fontSize:12, color:'#94a3b8', lineHeight:1.5, marginBottom:8 }}>{c.ai_summary}</div>}
                     {c.recording_url && <audio controls src={c.recording_url} style={{ width:'100%', height:32 }} />}
@@ -851,6 +1184,52 @@ export default function App() {
                   return <button key={s} onClick={()=>patchLead(selLead.id,{stage:s})} style={{ padding:'5px 10px', background:selLead.stage===s?theme:'#1a2540', border:`1px solid ${selLead.stage===s?theme:'rgba(255,255,255,.14)'}`, borderRadius:7, color:selLead.stage===s?'#fff':'#94a3b8', fontSize:11, cursor:'pointer', fontFamily:'Arial,sans-serif' }}>{sp.label}</button>
                 })}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK EDIT MODAL */}
+      {showBulkEdit && (
+        <div style={S.modalBg} onClick={e=>{if(e.target===e.currentTarget)setShowBulkEdit(false)}}>
+          <div style={{ ...S.modal, width:420 }}>
+            <div style={S.modalHead}>
+              <div style={S.modalTitle}>Edit {selectedIds.size} Lead{selectedIds.size!==1?'s':''}</div>
+              <button style={S.closeBtn} onClick={()=>setShowBulkEdit(false)}>x</button>
+            </div>
+            <div style={{ fontSize:12, color:'#4b6080', marginBottom:16 }}>Leave a field blank to keep existing values unchanged.</div>
+            <div style={S.field}>
+              <label style={S.label}>Stage</label>
+              <select value={bulkStage} onChange={e=>setBulkStage(e.target.value)} style={{ ...S.select, width:'100%' }}>
+                <option value="">— Keep existing —</option>
+                {['new_lead','contacted','appointment_set','doc_request','pre_approved','closed_won','closed_lost'].map(s=>(
+                  <option key={s} value={s}>{STAGE_PILLS[s]?.label||s}</option>
+                ))}
+              </select>
+            </div>
+            <div style={S.field}>
+              <label style={S.label}>Temperature</label>
+              <select value={bulkTemp} onChange={e=>setBulkTemp(e.target.value)} style={{ ...S.select, width:'100%' }}>
+                <option value="">— Keep existing —</option>
+                <option value="hot">Hot</option>
+                <option value="warm">Warm</option>
+                <option value="cold">Cold</option>
+                <option value="not_interested">Not Interested</option>
+              </select>
+            </div>
+            <div style={S.field}>
+              <label style={S.label}>Language</label>
+              <select value={bulkLang} onChange={e=>setBulkLang(e.target.value)} style={{ ...S.select, width:'100%' }}>
+                <option value="">— Keep existing —</option>
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+              </select>
+            </div>
+            <div style={{ display:'flex', gap:8, marginTop:8 }}>
+              <button style={{ ...S.btnPrimary, flex:1, padding:10 }} disabled={bulkApplying} onClick={applyBulkEdit}>
+                {bulkApplying ? 'Applying…' : 'Apply to ' + selectedIds.size + ' lead' + (selectedIds.size!==1?'s':'')}
+              </button>
+              <button style={{ ...S.btnOutline, padding:10 }} onClick={()=>setShowBulkEdit(false)}>Cancel</button>
             </div>
           </div>
         </div>
