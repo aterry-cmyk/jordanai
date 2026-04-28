@@ -7,17 +7,31 @@ const db = () =>
     process.env.SUPABASE_SERVICE_ROLE_KEY!
   );
 
-// Extract disposition from transcript or summary tags
+// Extract disposition tag from transcript or summary
 function extractDisposition(text: string): string | null {
   if (!text) return null;
   const m = text.match(/\[DISPOSITION:([A-Z_]+)\]/);
   return m?.[1] || null;
 }
 
-// Clean transcript of disposition tags before saving
+// Strip disposition tags before saving the transcript
 function cleanTranscript(t: string): string {
   if (!t) return '';
   return t.replace(/\[DISPOSITION:[A-Z_]+\]/g, '').trim();
+}
+
+// Detect if the call ended in voicemail
+function isVoicemailOutcome(endedReason: string): boolean {
+  if (!endedReason) return false;
+  const reasons = [
+    'voicemail',
+    'voicemail-left',
+    'call-ended-after-voicemail',
+    'assistant-said-voicemail-message',
+    'assistant-ended-call-after-message-spoken',
+  ];
+  const r = endedReason.toLowerCase();
+  return reasons.some((x) => r.includes(x));
 }
 
 export async function POST(req: NextRequest) {
@@ -43,15 +57,20 @@ export async function POST(req: NextRequest) {
           .update({ status, updated_at: new Date().toISOString() })
           .eq('vapi_call_id', vapiCallId);
       }
-      return NextResponse.json({ received: true, type: 'status-update', status });
+      return NextResponse.json({
+        received: true,
+        type: 'status-update',
+        status,
+      });
     }
 
     // ===== END OF CALL REPORT (the main event) =====
     if (type === 'end-of-call-report') {
-      const transcriptRaw = message.transcript || message.artifact?.transcript || '';
+      const transcriptRaw =
+        message.transcript || message.artifact?.transcript || '';
       const transcript = cleanTranscript(transcriptRaw);
-      
-      // Recording URLs — Vapi provides these
+
+      // Recording URLs
       const recordingUrl =
         message.recordingUrl ||
         message.artifact?.recordingUrl ||
@@ -70,13 +89,21 @@ export async function POST(req: NextRequest) {
       const summary = message.analysis?.summary || '';
       const sd = message.analysis?.structuredData || {};
 
-      // Disposition: prefer structured data, fall back to transcript tag
-      const disposition = (
-        sd.disposition ||
-        extractDisposition(transcriptRaw) ||
-        extractDisposition(summary) ||
-        'UNKNOWN'
-      ).toUpperCase();
+      // Voicemail detection
+      const wasVoicemail = isVoicemailOutcome(endedReason);
+
+      // Disposition: voicemail overrides; otherwise structured data → tag → unknown
+      let disposition: string;
+      if (wasVoicemail) {
+        disposition = 'VOICEMAIL';
+      } else {
+        disposition = (
+          sd.disposition ||
+          extractDisposition(transcriptRaw) ||
+          extractDisposition(summary) ||
+          'UNKNOWN'
+        ).toUpperCase();
+      }
 
       console.log('[VAPI WEBHOOK] EOCR:', {
         duration,
@@ -84,9 +111,10 @@ export async function POST(req: NextRequest) {
         hasStereo: !!recordingUrlStereo,
         disposition,
         endedReason,
+        wasVoicemail,
       });
 
-      // Get the lead_id from the existing call record
+      // Get lead_id from existing call record
       const { data: callRecord } = await db()
         .from('calls')
         .select('lead_id')
@@ -95,7 +123,7 @@ export async function POST(req: NextRequest) {
 
       const leadId = callRecord?.lead_id || call.metadata?.leadId || null;
 
-      // Update the calls row
+      // Update calls row
       const callUpdate: any = {
         status: 'completed',
         transcript: transcript || null,
@@ -105,7 +133,8 @@ export async function POST(req: NextRequest) {
         disposition,
         summary: summary || null,
         ended_reason: endedReason || null,
-        qualification_data: sd && Object.keys(sd).length > 0 ? sd : null,
+        qualification_data:
+          sd && Object.keys(sd).length > 0 ? sd : null,
         updated_at: new Date().toISOString(),
       };
 
@@ -118,7 +147,7 @@ export async function POST(req: NextRequest) {
         console.error('[VAPI WEBHOOK] calls update error:', callErr);
       }
 
-      // Update the lead with qualification data + disposition
+      // Update lead based on disposition
       if (leadId) {
         const leadUpdate: any = {
           last_called_at: new Date().toISOString(),
@@ -126,21 +155,26 @@ export async function POST(req: NextRequest) {
           updated_at: new Date().toISOString(),
         };
 
-        // Map structured data to lead columns
+        // Map structured qualification data → lead columns
         if (sd.area_interest) leadUpdate.target_area = sd.area_interest;
-        if (sd.bedrooms_needed != null) leadUpdate.bedroom_preference = sd.bedrooms_needed;
-        if (sd.currently_employed != null) leadUpdate.is_employed = sd.currently_employed;
-        if (sd.self_employed != null) leadUpdate.self_employed = sd.self_employed;
-        if (sd.annual_income_reported != null) leadUpdate.reported_income = sd.annual_income_reported;
+        if (sd.bedrooms_needed != null)
+          leadUpdate.bedroom_preference = sd.bedrooms_needed;
+        if (sd.currently_employed != null)
+          leadUpdate.is_employed = sd.currently_employed;
+        if (sd.self_employed != null)
+          leadUpdate.self_employed = sd.self_employed;
+        if (sd.annual_income_reported != null)
+          leadUpdate.reported_income = sd.annual_income_reported;
         if (sd.current_rent != null) leadUpdate.current_rent = sd.current_rent;
-        if (sd.down_payment_saved != null) leadUpdate.down_payment_available = sd.down_payment_saved;
+        if (sd.down_payment_saved != null)
+          leadUpdate.down_payment_available = sd.down_payment_saved;
         if (sd.credit_range) leadUpdate.credit_score_range = sd.credit_range;
         if (sd.co_buyer != null) leadUpdate.co_buyer = sd.co_buyer;
         if (sd.major_debts) leadUpdate.major_debts = sd.major_debts;
         if (sd.id_type) leadUpdate.id_type = sd.id_type;
         if (sd.case_type) leadUpdate.case_type = sd.case_type;
 
-        // Auto-advance lead stage based on disposition
+        // Auto-advance lead state based on disposition
         if (disposition === 'HOT') {
           leadUpdate.stage = 'Qualified';
           leadUpdate.temperature = 'HOT';
@@ -156,6 +190,14 @@ export async function POST(req: NextRequest) {
           leadUpdate.dnc = disposition === 'DNC';
         } else if (disposition === 'CALLBACK') {
           leadUpdate.temperature = 'WARM';
+        } else if (disposition === 'VOICEMAIL') {
+          // Voicemail dropped — queue SMS follow-up in 2 minutes
+          leadUpdate.temperature = 'WARM';
+          leadUpdate.last_voicemail_at = new Date().toISOString();
+          leadUpdate.pending_followup_channel = 'sms';
+          leadUpdate.pending_followup_at = new Date(
+            Date.now() + 2 * 60 * 1000
+          ).toISOString();
         }
 
         const { error: leadErr } = await db()
@@ -164,8 +206,11 @@ export async function POST(req: NextRequest) {
           .eq('id', leadId);
 
         if (leadErr) {
-          console.warn('[VAPI WEBHOOK] leads update partial:', leadErr.message);
-          // Retry with only core fields if column missing
+          console.warn(
+            '[VAPI WEBHOOK] leads update partial:',
+            leadErr.message
+          );
+          // Retry with only core fields if a column is missing
           await db()
             .from('leads')
             .update({
@@ -185,19 +230,23 @@ export async function POST(req: NextRequest) {
         duration,
         leadId,
         hasRecording: !!recordingUrl,
+        wasVoicemail,
       });
     }
 
-    // ===== TRANSCRIPT (live updates during call — optional logging) =====
+    // ===== TRANSCRIPT (live updates — skip for now) =====
     if (type === 'transcript') {
       return NextResponse.json({ received: true, type: 'transcript' });
     }
 
-    // ===== HANG (call ended) =====
+    // ===== HANG =====
     if (type === 'hang') {
       await db()
         .from('calls')
-        .update({ status: 'ended', updated_at: new Date().toISOString() })
+        .update({
+          status: 'ended',
+          updated_at: new Date().toISOString(),
+        })
         .eq('vapi_call_id', vapiCallId);
       return NextResponse.json({ received: true, type: 'hang' });
     }
@@ -213,5 +262,5 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
-  return NextResponse.json({ ok: true, endpoint: 'vapi webhook' });
+  return NextResponse.json({ ok: true, endpoint: 'vapi webhook v2' });
 }
