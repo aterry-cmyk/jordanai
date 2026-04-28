@@ -48,14 +48,21 @@ export async function POST(req: NextRequest) {
       .eq('lead_id', leadId);
     const attempt = (count || 0) + 1;
 
-    // First name with fallback
-    const firstName = (lead.first_name || '').trim() || (lang === 'es' ? 'amigo' : 'there');
+    // First name with safe fallback
+    const firstName =
+      (lead.first_name || '').trim() || (lang === 'es' ? 'amigo' : 'there');
 
-    // Pre-render the first message with the actual name (no variable substitution needed)
+    // Pre-rendered greeting (no variable substitution required)
     const firstMessage =
       lang === 'es'
         ? `Hola, ¿estoy hablando con ${firstName}?`
         : `Hi, am I speaking with ${firstName}?`;
+
+    // Voicemail message — short, personalized, primes SMS follow-up
+    const voicemailMessage =
+      lang === 'es'
+        ? `Hola ${firstName}, soy Vero de Dream Key Lending. Vi que mostraste interés en comprar casa por Facebook. Te llamo para ayudarte con un plan rápido. Te voy a mandar un texto ahorita con más info. ¡Hablamos!`
+        : `Hi ${firstName}, this is Vero from Dream Key Lending. I saw you showed interest in buying a home through Facebook. I'm calling to help you with a quick plan. I'll send you a text right now with more info. Talk soon!`;
 
     const res = await fetch(`${VAPI}/call`, {
       method: 'POST',
@@ -69,11 +76,16 @@ export async function POST(req: NextRequest) {
         phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
         assistantOverrides: {
           firstMessage,
+          voicemailMessage,
           variableValues: {
             first_name: firstName,
           },
         },
-        metadata: { leadId, language: lang, attemptNumber: attempt },
+        metadata: {
+          leadId,
+          language: lang,
+          attemptNumber: attempt,
+        },
       }),
     });
 
