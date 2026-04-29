@@ -51,17 +51,29 @@ export async function POST(req: NextRequest) {
     const firstName =
       (lead.first_name || '').trim() || (lang === 'es' ? 'amigo' : 'there');
 
-    // First message — pre-rendered with name
-    const firstMessage =
-      lang === 'es'
-        ? `Hola, ¿estoy hablando con ${firstName}?`
-        : `Hi, am I speaking with ${firstName}?`;
+    // CRITICAL FIX: SHORT first message, NOT a full sentence.
+    // Vapi has a known bug where the assistant speaks during ringing.
+    // A single word ends quickly; long messages get cut off.
+    // Source: Vapi community thread "The assistant speaks before the call is answered on outbound calls"
+    const firstMessage = lang === 'es' ? '¿Hola?' : 'Hello?';
 
-    // Voicemail message — short, personalized
+    // Voicemail message — short, personalized, primes SMS follow-up
     const voicemailMessage =
       lang === 'es'
         ? `Hola ${firstName}, soy Vero de Dream Key Lending. Vi que mostraste interés en comprar casa por Facebook. Te llamo para ayudarte con un plan rápido. Te voy a mandar un texto ahorita con más info. ¡Hablamos!`
         : `Hi ${firstName}, this is Vero from Dream Key Lending. I saw you showed interest in buying a home through Facebook. I'm calling to help you with a quick plan. I'll send you a text right now with more info. Talk soon!`;
+
+    // Idle messages — what Vero says if there's silence after greeting
+    // These also keep the audio loop alive during ringing → answer transition
+    const idleMessages =
+      lang === 'es'
+        ? ['¿Hola, me escucha?', '¿Sigue ahí?', 'Disculpe, ¿me puede escuchar?']
+        : ['Hello, can you hear me?', 'Are you still there?', "Sorry, can you hear me?"];
+
+    const silenceTimeoutMessage =
+      lang === 'es'
+        ? '¿Hola, me escucha?'
+        : 'Hello, can you hear me?';
 
     const res = await fetch(`${VAPI}/call`, {
       method: 'POST',
@@ -74,16 +86,27 @@ export async function POST(req: NextRequest) {
         },
         phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
         assistantOverrides: {
-          // CRITICAL FIX 1: assistant-speaks-first-with-model-generated-message
-          // OR keep assistant-speaks-first but Vapi will not speak during ringing.
-          // The bug is well-documented: assistant-speaks-first triggers during ring.
-          // Solution: use a longer silenceTimeout to outlast the ring window.
+          // SHORT first message — single word
           firstMessage,
-          firstMessageMode: 'assistant-speaks-first',
 
+          // Voicemail message
           voicemailMessage,
 
-          // CRITICAL FIX 2: Voicemail detection must be explicitly enabled here
+          // Override microphoneTimeout — give it 60 seconds to handle ring + voicemail pickup
+          silenceTimeoutSeconds: 60,
+          maxDurationSeconds: 600,
+
+          // CRITICAL: messagePlan with idleMessages
+          // This keeps the audio loop alive during ring → answer transition
+          // and prevents the 15-second microphoneTimeout from firing
+          messagePlan: {
+            idleMessages,
+            idleMessageMaxSpokenCount: 3,
+            idleTimeoutSeconds: 8,
+            silenceTimeoutMessage,
+          },
+
+          // Voicemail detection
           voicemailDetection: {
             provider: 'vapi',
             backoffPlan: {
@@ -94,14 +117,7 @@ export async function POST(req: NextRequest) {
             beepMaxAwaitSeconds: 10,
           },
 
-          // CRITICAL FIX 3: Override silence timeout to handle ring + voicemail pickup
-          // Default microphone timeout = 15s. Voicemail picks up at 20-25s.
-          // Set to 60s so the call survives until voicemail pickup.
-          silenceTimeoutSeconds: 60,
-
-          maxDurationSeconds: 600,
-
-          // Tell Vapi to leave the voicemail and end the call (don't try to qualify a voicemail)
+          // Don't auto-end on first response
           endCallMessage: '',
           endCallPhrases: [],
 
