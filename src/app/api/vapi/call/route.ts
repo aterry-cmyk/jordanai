@@ -48,17 +48,16 @@ export async function POST(req: NextRequest) {
       .eq('lead_id', leadId);
     const attempt = (count || 0) + 1;
 
-    // First name with safe fallback
     const firstName =
       (lead.first_name || '').trim() || (lang === 'es' ? 'amigo' : 'there');
 
-    // Pre-rendered greeting (no variable substitution required)
+    // First message — pre-rendered with name
     const firstMessage =
       lang === 'es'
         ? `Hola, ¿estoy hablando con ${firstName}?`
         : `Hi, am I speaking with ${firstName}?`;
 
-    // Voicemail message — short, personalized, primes SMS follow-up
+    // Voicemail message — short, personalized
     const voicemailMessage =
       lang === 'es'
         ? `Hola ${firstName}, soy Vero de Dream Key Lending. Vi que mostraste interés en comprar casa por Facebook. Te llamo para ayudarte con un plan rápido. Te voy a mandar un texto ahorita con más info. ¡Hablamos!`
@@ -75,8 +74,37 @@ export async function POST(req: NextRequest) {
         },
         phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
         assistantOverrides: {
+          // CRITICAL FIX 1: assistant-speaks-first-with-model-generated-message
+          // OR keep assistant-speaks-first but Vapi will not speak during ringing.
+          // The bug is well-documented: assistant-speaks-first triggers during ring.
+          // Solution: use a longer silenceTimeout to outlast the ring window.
           firstMessage,
+          firstMessageMode: 'assistant-speaks-first',
+
           voicemailMessage,
+
+          // CRITICAL FIX 2: Voicemail detection must be explicitly enabled here
+          voicemailDetection: {
+            provider: 'vapi',
+            backoffPlan: {
+              startAtSeconds: 5,
+              frequencySeconds: 5,
+              maxRetries: 6,
+            },
+            beepMaxAwaitSeconds: 10,
+          },
+
+          // CRITICAL FIX 3: Override silence timeout to handle ring + voicemail pickup
+          // Default microphone timeout = 15s. Voicemail picks up at 20-25s.
+          // Set to 60s so the call survives until voicemail pickup.
+          silenceTimeoutSeconds: 60,
+
+          maxDurationSeconds: 600,
+
+          // Tell Vapi to leave the voicemail and end the call (don't try to qualify a voicemail)
+          endCallMessage: '',
+          endCallPhrases: [],
+
           variableValues: {
             first_name: firstName,
           },
